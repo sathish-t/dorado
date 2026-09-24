@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+root="$PWD"
+
+# Linux builds need the CUDA toolkit even when inference uses --device cpu.
+# Do not install a GPU driver or download sequencing data or models here.
+packages=(build-essential gcc-11 g++-11 autoconf automake ca-certificates curl libssl-dev
+          zlib1g-dev ninja-build libxml2-dev pkg-config)
+missing=()
+for package in "${packages[@]}"; do
+  if [[ "$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)" != 'install ok installed' ]]; then
+    missing+=("$package")
+  fi
+done
+if ((${#missing[@]})); then
+  sudo apt-get update -qq
+  sudo apt-get install -y --no-install-recommends "${missing[@]}"
+fi
+
+echo 'Preparing CMake 3.31.10 (CUDA C++20 requires newer than Debian 12 CMake).'
+tools="$root/dorado-dependencies/build-tools"
+if [[ ! -x "$tools/bin/python" ]]; then
+  uv venv "$tools" --python 3.11
+fi
+uv pip install --python "$tools/bin/python" 'cmake==3.31.10'
+
+cuda="$root/dorado-dependencies/cuda-12.8"
+if [[ ! -x "$cuda/bin/nvcc" ]]; then
+  echo 'Installing CUDA 12.8 toolkit only; this can take several minutes.'
+  installer=$(mktemp)
+  trap 'rm -f "$installer"' EXIT
+  curl --fail --location --retry 2 \
+    https://developer.download.nvidia.com/compute/cuda/12.8.0/local_installers/cuda_12.8.0_570.86.10_linux.run \
+    --output "$installer"
+  sh "$installer" --silent --toolkit --toolkitpath="$cuda" --override
+  rm -f "$installer"
+  trap - EXIT
+fi
+
+echo 'Preparing pinned submodules and CMake dependencies.'
+git submodule update --init --recursive --jobs 4
+# GCC 12 emits false-positive string diagnostics under -O3 -Werror (GCC PR105329).
+"$tools/bin/cmake" -S . -B build -G Ninja \
+  -DCMAKE_C_COMPILER=gcc-11 -DCMAKE_CXX_COMPILER=g++-11 \
+  -DCMAKE_CUDA_HOST_COMPILER=g++-11 \
+  -DCMAKE_BUILD_TYPE=Release -DCUDAToolkit_ROOT="$cuda" \
+  -DDORADO_DISABLE_PACKAGING=ON -DGIT_SUBMODULE=OFF
+echo "Ready to build: $tools/bin/cmake --build build --target dorado --parallel 2"
